@@ -14,4 +14,3 @@ mylib.so: mylib.o
 
 clean:
 	rm -f *.o *.so
-

@@ -13,10 +13,12 @@
 #include <stdarg.h>
 #include <string.h>
 #include <err.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define MAXMSGLEN 100
+#define OFFSET 100
 
 // The following line declares a function pointer with the same prototype as the open function.  
 int (*orig_open)(const char *pathname, int flags, ...);  // mode_t mode is needed when flags includes O_CREAT
@@ -41,6 +43,26 @@ typedef struct {
 	size_t size;
 } rpc_header;
 
+typedef struct {
+	int path_length;
+	int flags;
+	mode_t mode;
+} open_header;
+
+typedef struct {
+	int fd;
+} close_header;
+
+typedef struct {
+	int fd;
+	size_t count;
+} read_header;
+
+typedef struct {
+	int fd;
+	size_t count;
+} write_header;
+
 enum {
 	OPEN,
 	CLOSE,
@@ -58,63 +80,99 @@ int sockfd;
 
 // This is our replacement for the open function from libc.
 int open(const char *pathname, int flags, ...) {
-	mode_t m=0;
+	mode_t m = 0;
 	if (flags & O_CREAT) {
 		va_list a;
 		va_start(a, flags);
 		m = va_arg(a, mode_t);
 		va_end(a);
+		fprintf(stderr, "modified mode\n");
 	}
 
-	char *msg = malloc(sizeof(rpc_header));
-	char buf[MAXMSGLEN+1];
+	// *** marshall data here ***
+	int length = sizeof(rpc_header) + sizeof(open_header) + strlen(pathname) + 1;
+	char *msg = malloc(length); 
+	char buf[MAXMSGLEN];
+	int offset = 0;
 	int rv;
 
 	// send message to server
-	rpc_header *head = malloc(sizeof(rpc_header));
+	rpc_header *head = malloc(sizeof(rpc_header)); 
 	head->opcode = OPEN;
-	head->size = sizeof(rpc_header);
+	head->size = sizeof(open_header) + strlen(pathname) + 1;
 	memcpy(msg, head, sizeof(rpc_header));
-	send(sockfd, msg, sizeof(rpc_header), 0);
+	offset += sizeof(rpc_header);
+
+	open_header *oHead = malloc(sizeof(open_header));
+	oHead->path_length = strlen(pathname) + 1;
+	oHead->flags = flags;
+	oHead->mode = m;
+	memcpy(msg + offset, oHead, sizeof(open_header));
+	offset += sizeof(open_header);
+
+	memcpy(msg + offset, pathname, strlen(pathname) + 1);
+	fprintf(stderr, "converted pathname: %s\n", msg + offset);
+	send(sockfd, msg, length, 0); 
 
 	// get message back
-	rv = recv(sockfd, buf, MAXMSGLEN, 0);	// get message
+	rv = recv(sockfd, buf, sizeof(int), 0);	// get message
 	if (rv < 0) err(1,0);			// in case something went wrong
 	buf[rv] = 0;				// null terminate string to print
+	int rfd = atoi(buf);
 
-	return orig_open(pathname, flags, m);
+	rv = recv(sockfd, buf, sizeof(int), 0);	// get errno 
+	if (rv < 0) err(1,0);			// in case something went wrong
+	buf[rv] = 0;				// null terminate string to print
+	errno = atoi(buf);
+
+	fprintf(stderr, "open: returned fd [%d] with errno [%d]\n", rfd, errno); 
+	return rfd;
 }
 
 // need to add functions for: close, read, write, lseek, stat, unlink, getdirentries
 int close(int fd) {
-	char *msg = malloc(sizeof(rpc_header));
-	char buf[MAXMSGLEN+1];
+	char *msg = malloc(sizeof(rpc_header) + sizeof(close_header));
+	char buf[MAXMSGLEN];
 	int rv;
 
+	// *** marshall data here ***
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = CLOSE;
-	head->size = sizeof(rpc_header);
+	head->size = sizeof(close_header);
 	memcpy(msg, head, sizeof(rpc_header));
-	send(sockfd, msg, sizeof(rpc_header), 0);
+
+	close_header *cHead = malloc(sizeof(close_header));
+	cHead->fd = fd;
+	memcpy(msg + sizeof(rpc_header), cHead, sizeof(close_header));
+	fprintf(stderr, "closing fd: %d\n", fd);
+	send(sockfd, msg, sizeof(rpc_header) + sizeof(close_header), 0);
 
 	// get message back
-	rv = recv(sockfd, buf, MAXMSGLEN, 0);	// get message
+	rv = recv(sockfd, buf, sizeof(int), 0);	// get message
 	if (rv < 0) err(1,0);			// in case something went wrong
 	buf[rv] = 0;				// null terminate string to print
+	int rstate = atoi(buf);
 
-	return orig_close(fd);
+	rv = recv(sockfd, buf, sizeof(int), 0);	// get errno
+	if (rv < 0) err(1,0);			// in case something went wrong
+	buf[rv] = 0;				// null terminate string to print
+	errno = atoi(buf);
+
+	fprintf(stderr, "close: returned state [%d] with errno [%d]\n", rstate, errno);
+
+	return rstate;
 }
 
 ssize_t read(int fd, void *buf, size_t count) {
 	char *msg = malloc(sizeof(rpc_header));
-	char buf1[MAXMSGLEN+1];
+	char buf1[MAXMSGLEN];
 	int rv;
 
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = READ;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -124,26 +182,83 @@ ssize_t read(int fd, void *buf, size_t count) {
 	buf1[rv] = 0;				// null terminate string to print
 
 	return orig_read(fd, buf, count);
+	// char *msg = malloc(sizeof(rpc_header) + sizeof(read_header));
+	// char buf1[MAXMSGLEN+1];
+	// int rv;
+
+	// // send message to server
+	// rpc_header *head = malloc(sizeof(rpc_header));
+	// head->opcode = READ;
+	// head->size = sizeof(rpc_header);
+	// memcpy(msg, head, sizeof(rpc_header));
+
+	// read_header *rHead = malloc(sizeof(read_header));
+	// rHead->fd = fd;
+	// rHead->count = count;
+	// memcpy(msg + sizeof(rpc_header), rHead, sizeof(read_header));
+	// send(sockfd, msg, sizeof(rpc_header) + sizeof(read_header), 0);
+
+	// // get message back
+	// rv = recv(sockfd, buf1, sizeof(ssize_t), 0);	// get message
+	// if (rv < 0) err(1,0);			// in case something went wrong
+	// buf1[rv] = 0;				// null terminate string to print
+	// ssize_t read_bytes = (ssize_t) atoi(buf1);
+
+	// rv = recv(sockfd, buf1, sizeof(int), 0);	// get errno
+	// if (rv < 0) err(1,0);			// in case something went wrong
+	// buf1[rv] = 0;				// null terminate string to print
+	// errno = atoi(buf1);
+
+	// memcpy(buf, msg + sizeof(ssize_t) + sizeof(int), count);
+
+	// fprintf(stderr, "read: returned [%ld] read bytes with errno [%d]\n", read_bytes, errno);
+	// return read_bytes;
 }
 
 ssize_t write(int fd, const void *buf, size_t count) {
-	char *msg = malloc(sizeof(rpc_header));
-	char buf1[MAXMSGLEN+1];
+	int length = sizeof(rpc_header) + sizeof(write_header) + count;
+	// fprintf(stderr, "length [%d]\n", length);
+	char *msg = malloc(length);
+	char buf1[MAXMSGLEN];
+	int offset = 0;
 	int rv;
+	ssize_t write_bytes = 0;
 
+	// *** marshall data here ***
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = WRITE;
-	head->size = sizeof(rpc_header);
+	head->size = sizeof(write_header) + count;
 	memcpy(msg, head, sizeof(rpc_header));
-	send(sockfd, msg, sizeof(rpc_header), 0);
+	offset += sizeof(rpc_header);
+	// fprintf(stderr, "offset: %d\n", offset);
+
+	write_header *wHead = malloc(sizeof(write_header));
+	wHead->fd = fd;
+	wHead->count = count;
+	memcpy(msg + offset, wHead, sizeof(write_header));
+	offset += sizeof(write_header);
+	// fprintf(stderr, "offset: %d\n", offset);
+
+	memcpy(msg + offset, buf, count);
+
+	fprintf(stderr, "writing [%ld] bytes to fd [%d]\n", wHead->count, wHead->fd);
+	send(sockfd, msg, length, 0);
 
 	// get message back
-	rv = recv(sockfd, buf1, MAXMSGLEN, 0);	// get message
+	rv = recv(sockfd, buf1, sizeof(ssize_t), 0);	// get message
 	if (rv < 0) err(1,0);			// in case something went wrong
 	buf1[rv] = 0;				// null terminate string to print
+	write_bytes = (ssize_t) atoi(buf1);
 
-	return orig_write(fd, buf, count);
+	rv = recv(sockfd, buf1, sizeof(int), 0);	// get errno
+	if (rv < 0) err(1,0);			// in case something went wrong
+	buf1[rv] = 0;				// null terminate string to print
+	errno = atoi(buf1);
+
+	fprintf(stderr, "write: bytes written [%ld] with errno [%d]\n", write_bytes, errno);
+
+	return write_bytes;
 }
 
 off_t lseek(int fd, off_t offset, int whence) {
@@ -154,7 +269,7 @@ off_t lseek(int fd, off_t offset, int whence) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = LSEEK;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -174,7 +289,7 @@ int stat(const char *pathname, struct stat *statbuf) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = STAT;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -193,7 +308,7 @@ int unlink(const char *pathname) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = UNLINK;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -212,7 +327,7 @@ ssize_t getdirentries(int fd, char *buf, size_t nbytes, off_t *basep) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = GETDIRENTRIES;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -231,7 +346,7 @@ struct dirtreenode* getdirtree(char *path) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = GETDIRTREE;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
@@ -250,7 +365,7 @@ void freedirtree(struct dirtreenode* dt) {
 	// send message to server
 	rpc_header *head = malloc(sizeof(rpc_header));
 	head->opcode = FREEDIRTREE;
-	head->size = sizeof(rpc_header);
+	head->size = 0;
 	memcpy(msg, head, sizeof(rpc_header));
 	send(sockfd, msg, sizeof(rpc_header), 0);
 
