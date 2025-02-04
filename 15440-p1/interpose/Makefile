@@ -1,10 +1,7 @@
 all: mylib.so server
 
-server: server.o
-	gcc -Wall -Werror server.o -o server -L../lib -ldirtree
-
-server.o: server.c
-	gcc -Wall -Werror -I../include -c server.c 
+server: server.c
+	gcc -Wall server.c -o server -I../include -L../lib -l dirtree
 
 mylib.o: mylib.c
 	gcc -Wall -fPIC -DPIC -c mylib.c
