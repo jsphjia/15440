@@ -1,12 +1,13 @@
 export CLASSPATH=$PWD:$PWD/../lib
-export proxyport15440=11122
+export proxyport15440=11123
 export pin15440=15
 
-java Proxy 127.0.0.1 11122 /tmp/cache 100000
+java Proxy 127.0.0.1 11122 cache-files 100000
 
-java Server 11122 fileroot
+java Server 11122 server-files
 
 LD_PRELOAD=../lib/lib440lib.so ../tools/440read foo
+LD_PRELOAD=../lib/lib440lib.so ./test
 
 For submitting: 
-tar cvzf ../mysolution.tgz Makefile Proxy.java Server.java 
+tar cvzf ../mysolution.tgz Makefile Proxy.java Server.java Cache.java RMIInterface.java
