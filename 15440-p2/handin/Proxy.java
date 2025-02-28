@@ -1,6 +1,17 @@
+/**
+ * File: Proxy.java
+ * Description: Implements a file-caching proxy
+ * Author: Joseph Jia (josephji)
+ * 
+ * This file implements a file-caching proxy that acts as an intermidiate
+ * between the client and server. The proxy uses Java RMI to communicate
+ * with the server.
+ */
+
 // Imported Libraries
 import java.io.*;
 import java.nio.file.OpenOption;
+import java.nio.file.*;
 import java.util.*;
 import java.rmi.*;
 import java.rmi.registry.Registry;
@@ -20,527 +31,641 @@ class Proxy {
 	public static Cache cache;
 	public static int max_size;
 	public static String cache_dir;
+	public static Object cache_lock = new Object();
 
-	// Additional Error Values
+	// Additional Constant Values
 	public static final int EIO = -5;
-
-	// Storing file info
-	public static class fileInfo{
-		boolean isDirectory;
-        int length;
-        byte[] info;
-    }
+	public static final int CHUNK_SIZE = 50000;
 
 	private static class FileHandler implements FileHandling {
-
+		/*
+		 * Function: getFd
+		 * This function determines the file descriptor for the next file.
+		 * Uses synchronization to ensure unique file descriptors.
+		 * 
+		 * @return file descriptor value
+		 */
 		public synchronized int getFd() {
 			int fd = curr_fd;
 			curr_fd ++;
 			return fd;
 		}
 
-		// Function: open
+		/*
+		 * Function: open
+		 * This function implements the file open function.
+		 * It calls the server to create a file and stores it in the cache.
+		 * 
+		 * @param path - file path to open
+		 * @param o - mode to open file with
+		 * @return file descriptor on success; error value on failure
+		 */
 		public int open (String path, OpenOption o) {
-			int fd;
+			int fd, buf_size, max_ver;
+			long length, curr_pos;
 			File file, fd_file;
-			String fd_path, cache_path;
+			String fd_path, cache_path, min_path, dir_path;
 			RandomAccessFile raf, fd_raf, tmp_raf;
 			byte[] buf;
+
+			min_path = Path.of(path).normalize().toString();
+			dir_path = Path.of(cache_dir + "/" + path).normalize().toString();
+
+			// make sure path is in working directory
+			if (!dir_path.startsWith(cache_dir)) {
+				return Errors.EINVAL;
+			}
+
+			// get max version
+			try {
+				max_ver = stub.serverExists(min_path);
+			} catch (RemoteException e) {
+				System.err.println(e.toString());
+				return EIO;
+			}
+			if (max_ver != 0) {
+				cache_path = dir_path + "-" + max_ver;
+			}
+			else {
+				cache_path = dir_path;
+			}
+
 			switch (o) {
 				case CREATE:
 					try {
-						System.err.printf("open (create): file [%s]\n", path);
-						cache_path = cache_dir + "/" + path;
-
-						// check if file exists on the cache already
-						// implies the file already exists on server
-						if (cache.lru_cache.containsKey(cache_path)) {
-							System.err.printf("open (create): file [%s] in cache\n", cache_path);
-							file = cache.lru_cache.get(cache_path);
-
-							// update file from server
-							// buf = stub.getFileInfo(path);
-							tmp_raf = new RandomAccessFile(file, "rw");
-							tmp_raf.seek(0);
-							buf = new byte[(int) tmp_raf.length()];
-							tmp_raf.read(buf);
-							tmp_raf.seek(0);
-
-						}
-						// file doesn't exist in the cache
-						else {
-							// check if file exists on server
-							if (!stub.serverExists(path)) {
-								stub.createFile(path);
-								System.err.printf("open (create): server created file [%s]\n", path);
+						synchronized (cache_lock) {
+							// check if file exists on the cache already
+							if (cache.containsKey(cache_path)) {
+								file = cache.get(cache_path);
+								tmp_raf = new RandomAccessFile(file, "rw");
 							}
-							System.err.printf("open (create): file exists on server [%b]\n", stub.serverExists(path));
+							else {
+								// check if file exists on server
+								if (max_ver == 0) {
+									stub.createFile(min_path);
+									max_ver++;
+								}
 
-							// check if file exists on proxy
-							file = new File(cache_path);
-							if (!file.exists()) {
-								file.createNewFile();
+								// check if file exists on proxy
+								cache_path = dir_path + "-" + max_ver;
+								file = new File(cache_path);
+								if (!file.exists()) {
+									// create parent directories if they exist
+									if (file.getParentFile() != null) {
+										file.getParentFile().mkdirs();
+									}
+									file.createNewFile();
+								}
+
+								// copy over contents from server copy to proxy copy
+								length = stub.getFileLength(min_path);
+								curr_pos = 0;
+								tmp_raf = new RandomAccessFile(file, "rw");
+								while (curr_pos < length) {
+									buf = stub.getFileInfo(min_path, curr_pos);
+									tmp_raf.seek(curr_pos);
+									tmp_raf.write(buf);
+									curr_pos += buf.length;
+								}
+								cache.put(cache_path, file);
 							}
-							System.err.printf("open (create): file exists on proxy [%b]\n", file.exists());
-
-							// copy over contents from server copy to proxy copy
-							buf = stub.getFileInfo(path);
-							tmp_raf = new RandomAccessFile(file, "rw");
-							tmp_raf.seek(0);
-							tmp_raf.write(buf);
-
-							cache.lru_cache.put(cache_path, file);
-							System.err.printf("open (create): file exists in cache [%b]\n", cache.lru_cache.containsKey(cache_path));
 						}
 
 						// create fd copy
 						fd = getFd();
-						fd_path = path + "-fd" + fd;
+						min_path = min_path + "-" + max_ver;
+						fd_path = cache_dir + "/" + min_path + "-w" + fd;
+						System.err.println(fd_path);
 						fd_file = new File(fd_path);
+						if (fd_file.getParentFile() != null) {
+							fd_file.getParentFile().mkdirs();
+						}
 						fd_file.createNewFile();
 						fd_file.setReadable(true, false);
 						fd_file.setWritable(true, false);
 
 						// copy over contents from proxy copy to fd copy
 						fd_raf = new RandomAccessFile(fd_file, "rw");
-						fd_raf.seek(0);
-						fd_raf.write(buf);
+						length = tmp_raf.length();
+						curr_pos = 0;
+						tmp_raf.seek(0);
+						while (curr_pos < length) {
+							if (length - curr_pos > CHUNK_SIZE) {
+								buf_size = CHUNK_SIZE;
+							}
+							else {
+								buf_size = (int)(length - curr_pos);
+							}
+							buf = new byte[buf_size];
+							tmp_raf.seek(curr_pos);
+							tmp_raf.read(buf);
+							fd_raf.seek(curr_pos);
+							fd_raf.write(buf);
+							curr_pos += buf_size;
+						}
 						fd_raf.seek(0);
 
 						// update all hash maps
-						fd_paths.put(fd, path);
+						fd_paths.put(fd, min_path);
 						fd_files.put(fd, fd_raf);
-						System.err.printf("open (create): fd [%d] for path [%s]\n", fd, fd_path);
+						cache.put(fd_path, fd_file);
+						cache.addClient(fd_path);
 						return fd;
 					} catch (IOException e) {
-						System.err.printf("open (create): error [%s]", e.toString());
+						System.err.println("open (create): " + e.toString());
 						return EIO;
 					}
 				case CREATE_NEW:
 					try {
-						System.err.printf("open (create_new): file [%s]\n", path);
-						cache_path = cache_dir + "/" + path;
-
 						// check if file exists on the cache already
-						// implies the file already exists on server
-						if (cache.lru_cache.containsKey(cache_path)) {
-							System.err.printf("open (create_new): file [%s] in cache\n", cache_path);
-							return Errors.EEXIST;
-						}
-						// file doesn't exist in the cache
-						else {
-							// check if file exists on server
-							if (stub.serverExists(path)) {
-								System.err.printf("open (create_new): file [%s] exists on server\n", path);
+						synchronized (cache_lock) {
+							if (cache.containsKey(cache_path)) {
 								return Errors.EEXIST;
 							}
+							// file doesn't exist in the cache
+							else {
+								// check if file exists on server
+								if (max_ver != 0) {
+									return Errors.EEXIST;
+								}
 
-							// check if file exists on proxy
-							file = new File(cache_path);
-							if (file.exists()) {
-								System.err.printf("open (create_new): file [%s] exists on proxy\n", path);
-								return Errors.EEXIST;
+								// check if file exists on proxy
+								cache_path = dir_path + "-1";
+								file = new File(cache_path);
+								if (file.exists()) {
+									return Errors.EEXIST;
+								}
+								stub.createFile(path);
+								max_ver++;
+								// create parent directories if they exist
+								if (file.getParentFile() != null) {
+									file.getParentFile().mkdirs();
+								}
+								file.createNewFile();
+
+								// copy over contents from server copy to proxy copy
+								length = stub.getFileLength(path);
+								curr_pos = 0;
+								tmp_raf = new RandomAccessFile(file, "rw");
+								while (curr_pos < length) {
+									buf = stub.getFileInfo(path, curr_pos);
+									tmp_raf.seek(curr_pos);
+									tmp_raf.write(buf);
+									curr_pos += buf.length;
+								}
+
+								cache.put(cache_path, file);
 							}
-							stub.createFile(path);
-							file.createNewFile();
-							System.err.printf("open (create_new): file exists on proxy [%b]\n", file.exists());
-
-							// copy over contents from server copy to proxy copy
-							buf = stub.getFileInfo(path);
-							tmp_raf = new RandomAccessFile(file, "rw");
-							tmp_raf.seek(0);
-							tmp_raf.write(buf);
-
-							cache.lru_cache.put(cache_path, file);
-							System.err.printf("open (create_new): file exists in cache [%b]\n", cache.lru_cache.containsKey(cache_path));
 						}
 
 						// create fd copy
 						fd = getFd();
-						fd_path = path + "-fd" + fd;
+						min_path = min_path + "-" + max_ver;
+						fd_path = cache_dir + "/" + min_path + "-w" + fd;
 						fd_file = new File(fd_path);
+						if (fd_file.getParentFile() != null) {
+							fd_file.getParentFile().mkdirs();
+						}
 						fd_file.createNewFile();
 						fd_file.setReadable(true, false);
 						fd_file.setWritable(true, false);
 
 						// copy over contents from proxy copy to fd copy
 						fd_raf = new RandomAccessFile(fd_file, "rw");
-						fd_raf.seek(0);
-						fd_raf.write(buf);
+						length = tmp_raf.length();
+						curr_pos = 0;
+						tmp_raf.seek(0);
+						while (curr_pos < length) {
+							if (length - curr_pos > CHUNK_SIZE) {
+								buf_size = CHUNK_SIZE;
+							}
+							else {
+								buf_size = (int)(length - curr_pos);
+							}
+							buf = new byte[buf_size];
+							tmp_raf.seek(curr_pos);
+							tmp_raf.read(buf);
+							fd_raf.seek(curr_pos);
+							fd_raf.write(buf);
+							curr_pos += buf_size;
+						}
 						fd_raf.seek(0);
 
 						// update all hash maps
-						fd_paths.put(fd, path);
+						fd_paths.put(fd, min_path);
 						fd_files.put(fd, fd_raf);
-						System.err.printf("open (create_new): fd [%d] for path [%s]\n", fd, fd_path);
+						cache.put(fd_path, fd_file);
+						cache.addClient(fd_path);
 						return fd;
 					} catch (IOException e) {
-						System.err.printf("open (create_new): error [%s]", e.toString());
+						System.err.println("open (create_new): " + e.toString());
 						return EIO;
 					}
 				case READ:
 					try{
-						System.err.printf("open (read): file [%s]\n", path);
-						cache_path = cache_dir + "/" + path;
-
 						// check if file exists on the cache already
-						// implies the file already exists on server
-						if (cache.lru_cache.containsKey(cache_path)) {
-							System.err.printf("open (read): file [%s] in cache\n", cache_path);
-							file = cache.lru_cache.get(cache_path);
+						synchronized (cache_lock) {
+							if (cache.containsKey(cache_path)) {
+								file = cache.get(cache_path);
+							}
+							else {
+								// check if file exists on server
+								if (max_ver == 0) {
+									return Errors.ENOENT;
+								}
+
+								// check if file exists on proxy
+								file = new File(cache_path);
+								if (!file.exists()) {
+									// create parent directories if they exist
+									if (file.getParentFile() != null) {
+										file.getParentFile().mkdirs();
+									}
+									// create the file
+									file.createNewFile();
+								}
+
+								// copy over contents from server copy to proxy copy
+								length = stub.getFileLength(path);
+								curr_pos = 0;
+								tmp_raf = new RandomAccessFile(file, "rw");
+								while (curr_pos < length) {
+									buf = stub.getFileInfo(path, curr_pos);
+									// System.err.printf("open (read): buf size [%d] and curr_pos [%d]\n", buf.length, curr_pos);
+									tmp_raf.seek(curr_pos);
+									tmp_raf.write(buf);
+									curr_pos += buf.length;
+								}
+								cache.put(cache_path, file);
+							}
+							cache.addClient(cache_path);
+						}
+
+						fd = getFd();
+						fd_paths.put(fd, cache_path);
+
+						if(!file.isDirectory()) {
+							fd_raf = new RandomAccessFile(file, "r");
+							fd_files.put(fd, fd_raf);
+						}
+						return fd;
+					} catch (IOException e) {
+						System.err.println("open (read): " + e.toString());
+						return EIO;
+					}
+				case WRITE:
+				try{
+					// check if file exists on the cache already
+					synchronized (cache_lock) {
+						if (cache.containsKey(cache_path)) {
+							file = cache.get(cache_path);
 
 							// update file from server
-							// buf = stub.getFileInfo(path);
-							// System.err.printf("open (read): buf length [%d]\n", buf.length);
 							tmp_raf = new RandomAccessFile(file, "rw");
-							tmp_raf.seek(0);
-							buf = new byte[(int) tmp_raf.length()];
-							tmp_raf.read(buf);
-							tmp_raf.seek(0);
 						}
 						else {
 							// check if file exists on server
-							if (!stub.serverExists(path)) {
-								System.err.printf("open (read): file [%s] not on server\n", path);
+							if (max_ver == 0) {
 								return Errors.ENOENT;
 							}
 
 							// check if file exists on proxy
 							file = new File(cache_path);
+							if (file.isDirectory()) {
+								return Errors.EISDIR;
+							}
 							if (!file.exists()) {
+								// create parent directories if they exist
+								if (file.getParentFile() != null) {
+									file.getParentFile().mkdirs();
+								}
 								file.createNewFile();
 							}
-							System.err.printf("open (read): file exists on proxy [%b]\n", file.exists());
 
 							// copy over contents from server copy to proxy copy
-							buf = stub.getFileInfo(path);
+							length = stub.getFileLength(path);
+							curr_pos = 0;
 							tmp_raf = new RandomAccessFile(file, "rw");
-							tmp_raf.seek(0);
-							tmp_raf.write(buf);
-
-							cache.lru_cache.put(cache_path, file);
-							System.err.printf("open (read): file exists in cache [%b]\n", cache.lru_cache.containsKey(cache_path));
+							while (curr_pos < length) {
+								buf = stub.getFileInfo(path, curr_pos);
+								tmp_raf.seek(curr_pos);
+								tmp_raf.write(buf);
+								curr_pos += buf.length;
+							}
+							cache.put(cache_path, file);
 						}
-
-						if (!file.isDirectory()) {
-							// create fd copy
-							fd = getFd();
-							fd_path = path + "-fd" + fd;
-							fd_file = new File(fd_path);
-							fd_file.createNewFile();
-							fd_file.setReadable(true, false);
-							fd_file.setWritable(true, false);
-
-							// copy over contents from proxy copy to fd copy
-							fd_raf = new RandomAccessFile(fd_file, "rw");
-							fd_raf.seek(0);
-							fd_raf.write(buf);
-							fd_raf.seek(0);
-							fd_file.setWritable(false, false);
-
-							// update all hash maps
-							fd_paths.put(fd, path);
-							fd_files.put(fd, fd_raf);
-							System.err.printf("open (read): fd [%d] for path [%s]\n", fd, fd_path);
-						}
-						else {
-							fd = getFd();
-							fd_path = path + "-fd" + fd;
-							fd_file = new File(fd_path);
-							fd_file.createNewFile();
-							fd_file.setReadable(true, false);
-							fd_file.setWritable(false, false);
-							fd_paths.put(fd, path);
-							System.err.printf("open (read): fd [%d] for direcory [%s]\n", fd, fd_path);
-						}
-						return fd;
-					} catch (IOException e) {
-						System.err.printf("open (read): error [%s]", e.toString());
-						return EIO;
-					}
-				case WRITE:
-				try{
-					System.err.printf("open (write): file [%s]\n", path);
-					cache_path = cache_dir + "/" + path;
-
-					// check if file exists on the cache already
-					// implies the file already exists on server
-					if (cache.lru_cache.containsKey(cache_path)) {
-						System.err.printf("open (write): file [%s] in cache\n", cache_path);
-						file = cache.lru_cache.get(cache_path);
-
-						// update file from server
-						// buf = stub.getFileInfo(path);
-						tmp_raf = new RandomAccessFile(file, "rw");
-						tmp_raf.seek(0);
-						buf = new byte[(int) tmp_raf.length()];
-						tmp_raf.read(buf);
-						tmp_raf.seek(0);
-					}
-					else {
-						// check if file exists on server
-						if (!stub.serverExists(path)) {
-							System.err.printf("open (write): file [%s] not on server\n", path);
-							return Errors.ENOENT;
-						}
-
-						// check if file exists on proxy
-						file = new File(cache_path);
-						if (file.isDirectory()) {
-							System.err.printf("open (write): file [%s] is a directory\n", cache_path);
-							return Errors.EISDIR;
-						}
-						if (!file.exists()) {
-							file.createNewFile();
-						}
-						System.err.printf("open (write): file exists on proxy [%b]\n", file.exists());
-
-						// copy over contents from server copy to proxy copy
-						buf = stub.getFileInfo(path);
-						tmp_raf = new RandomAccessFile(file, "rw");
-						tmp_raf.seek(0);
-						tmp_raf.write(buf);
-
-						cache.lru_cache.put(cache_path, file);
-						System.err.printf("open (write): file exists in cache [%b]\n", cache.lru_cache.containsKey(cache_path));
 					}
 
 					// create fd copy
 					fd = getFd();
-					fd_path = path + "-fd" + fd;
+					min_path = min_path + "-" + max_ver;
+					fd_path = cache_dir + "/" + min_path + "-w" + fd;
+					System.err.println(fd_path);
 					fd_file = new File(fd_path);
+					if (fd_file.getParentFile() != null) {
+						fd_file.getParentFile().mkdirs();
+					}
 					fd_file.createNewFile();
 					fd_file.setReadable(true, false);
 					fd_file.setWritable(true, false);
 
 					// copy over contents from proxy copy to fd copy
 					fd_raf = new RandomAccessFile(fd_file, "rw");
-					fd_raf.seek(0);
-					fd_raf.write(buf);
+					length = tmp_raf.length();
+					curr_pos = 0;
+					tmp_raf.seek(0);
+					while (curr_pos < length) {
+						if (length - curr_pos > CHUNK_SIZE) {
+							buf_size = CHUNK_SIZE;
+						}
+						else {
+							buf_size = (int)(length - curr_pos);
+						}
+						buf = new byte[buf_size];
+						tmp_raf.seek(curr_pos);
+						tmp_raf.read(buf);
+						fd_raf.seek(curr_pos);
+						fd_raf.write(buf);
+						curr_pos += buf_size;
+					}
 					fd_raf.seek(0);
 
 					// update all hash maps
-					fd_paths.put(fd, path);
+					fd_paths.put(fd, min_path);
 					fd_files.put(fd, fd_raf);
-					System.err.printf("open (write): fd [%d] for path [%s]\n", fd, fd_path);
+					cache.put(fd_path, fd_file);
+					cache.addClient(fd_path);
 					return fd;
 				} catch (IOException e) {
-					System.err.printf("open (write): error [%s]", e.toString());
+					System.err.println("open (write): " + e.toString());
 					return EIO;
 				}
 				default:
-					System.err.println("open: invalid option given.\n");
 					return Errors.EINVAL;
 			}
 		}
 
+		/*
+		 * Function: close
+		 * This function implements the file close function.
+		 * On close, file is updated on the server and local cache.
+		 * 
+		 * @param fd - file descriptor of file to close
+		 * @return 0 on success, error value on failure
+		 */
 		public int close (int fd) {
-			System.err.printf("close: received fd [%d]\n", fd);
-			String path = fd_paths.get(fd);
-			String fd_path = path + "-fd" + fd;
+			String base_path = fd_paths.get(fd);
+			String fd_path;
+
+			if (base_path.startsWith(cache_dir)) { // read only fd case
+				fd_files.remove(fd);
+				fd_paths.remove(fd);
+				cache.get(base_path);
+				cache.removeClient(base_path, false, fd);
+				cache.checkStaleVersions(base_path);
+				return 0;
+			}
+
+			fd_path = cache_dir + "/" + base_path + "-w" + fd;
+			int old_ver = Integer.parseInt(base_path.substring(base_path.lastIndexOf("-")+1));
+			int new_ver = old_ver + 1;
+			String old_path = cache_dir + "/" + base_path.substring(0, base_path.lastIndexOf("-")+1) + old_ver;
+			String cache_path = cache_dir + "/" + base_path.substring(0, base_path.lastIndexOf("-")+1) + new_ver;
+			String server_path = base_path.substring(0, base_path.lastIndexOf("-"));
+
 			File file = new File(fd_path);
 			if (!file.exists()) {
-				System.err.printf("close: fd [%s] not found.\n", fd);
 				return Errors.ENOENT;
 			}
+
 			if(file.isDirectory()) {
 				fd_paths.remove(fd);
-				System.err.printf("closed directory fd [%d]\n", fd);
 				return 0;
 			}
 			try {
 				RandomAccessFile close_raf = fd_files.get(fd);
 				if (file.canWrite()) {
-					String cache_path = cache_dir + "/" + path;
-					File cache_file = new File(cache_path);
+					File cache_file;
+					cache_file = new File(cache_path);
+					cache_file.createNewFile();
+					cache.checkStaleVersions(cache_path);
+					cache.put(cache_path, cache_file);
 					RandomAccessFile raf = new RandomAccessFile(cache_file, "rw");
-					byte[] buf = new byte[(int) raf.length()];
-					raf.seek(0);
-					raf.write(buf);
-					buf = new byte[(int) close_raf.length()];
-					close_raf.seek(0);
-					close_raf.read(buf);
-					stub.updateFile(path, buf); // update server
-					raf.seek(0);
-					raf.write(buf); // update proxy version
+
+					long length = close_raf.length();
+					long old_length = raf.length();
+					long curr_pos = 0;
+					int buf_size;
+					while (curr_pos < length) {
+						if (length - curr_pos > CHUNK_SIZE) {
+							buf_size = CHUNK_SIZE;
+						}
+						else {
+							buf_size = (int)(length - curr_pos);
+						}
+
+						byte[] buf = new byte[buf_size];
+						raf.seek(curr_pos);
+						raf.write(buf); // clear cache version
+
+						close_raf.seek(curr_pos);
+						close_raf.read(buf);
+						stub.updateFile(server_path, buf, curr_pos); // update server
+						raf.seek(curr_pos);
+						raf.write(buf); // update cache version
+						curr_pos += buf_size;
+					}
+					synchronized (cache_lock) {
+						cache.curr_size += (length - old_length);
+					}
 				}
 				close_raf.close();
+				cache.removeClient(old_path, true, fd);
 				fd_files.remove(fd);
 				fd_paths.remove(fd);
-				System.err.printf("closed file fd [%d]\n", fd);
 				return 0;
 			} catch (IOException e) {
-				System.err.println("close: error detected.");
-				return -5;
+				System.err.println("close: " + e.toString());
+				return EIO;
 			}
 		}
 
+		/*
+		 * Function: write
+		 * This function implements the file write function.
+		 * 
+		 * @param fd - file descriptor of file to write to
+		 * @param buf - buffer of content to write to file
+		 * @return number of bytes written to file
+		 */
 		public long write (int fd, byte[] buf) {
-			System.err.printf("write: received fd [%d] and buf length [%d]\n", fd, buf.length);
 			if (buf == null) {
-				System.err.println("write: null buffer.");
 				return Errors.EBADF;
 			}
 			if (!fd_paths.containsKey(fd)) {
-				System.err.println("write: fd doesn't exist.");
 				return Errors.EBADF;
 			}
-			String fd_path = fd_paths.get(fd) + "-fd" + fd;
+
+			String fd_path = cache_dir + "/" + fd_paths.get(fd) + "-w" + fd;
 			File file = new File(fd_path);
 			try {
 				if (file.isDirectory()) {
-					System.err.println("write: file is a directory.");
 					return Errors.EISDIR;
 				}
 				if (!file.exists()) {
-					System.err.println("write: file doesn't exist.");
 					return Errors.EBADF;
 				}
 				if (!file.canWrite()) {
-					System.err.println("write: file has no write permission.");
 					return Errors.EBADF;
 				}
 			} catch (SecurityException s) {
-				System.err.println("write: SecurityException error.");
+				System.err.println("write: " + s.toString());
 				return Errors.EBADF;
 			}
 
 			RandomAccessFile write_raf = fd_files.get(fd);
-			synchronized (write_raf) {
-				try {
-					System.err.printf("pos before: %d\n", write_raf.getFilePointer());
-					write_raf.write(buf);
-					System.err.printf("pos after: %d\n", write_raf.getFilePointer());
-					System.err.printf("write: bytes written [%d]\n", buf.length);
-					return (long) buf.length;
-				} catch (IOException e) {
-					System.err.println("write: IO error detected.");
-					return -5;
-				}
+			try {
+				write_raf.write(buf);
+				return (long) buf.length;
+			} catch (IOException e) {
+				System.err.println("write: " + e.toString());
+				return -EIO;
 			}
 		}
 
+		/*
+		 * Function: read
+		 * This function implements the file read function.
+		 * 
+		 * @param fd - file descriptor of file to read from
+		 * @param buf - buffer to read content into
+		 * @return number of bytes read into buf
+		 */
 		public long read (int fd, byte[] buf) {
-			System.err.printf("read: received fd [%d]\n", fd);
 			if (!fd_paths.containsKey(fd)) {
-				System.err.printf("read: fd [%d] doesn't exist.\n", fd);
 				return Errors.EBADF;
 			}
-			String fd_path = fd_paths.get(fd) + "-fd" + fd;
+			String fd_path = fd_paths.get(fd);
+
+			// check if the fd corresponds to a read-only fd
+			if (!fd_path.startsWith(cache_dir)) {
+				fd_path = cache_dir + "/" + fd_paths.get(fd) + "-w" + fd;
+			}
+
 			File file = new File(fd_path);
 			try {
 				if (file.isDirectory()) {
-					System.err.println("read: file is a directory.");
 					return Errors.EISDIR;
 				}
 				if (!file.exists()) {
-					System.err.println("read: file doesn't exist.");
 					return Errors.ENOENT;
 				}
 				if (!file.canRead()) {
-					System.err.println("read: file has no read permission.");
 					return Errors.EBADF;
 				}
 			} catch (SecurityException s) {
-				System.err.println("read: SecurityException error.");
+				System.err.println("read: " + s.toString());
 				return Errors.EBADF;
 			}
 
 			RandomAccessFile read_raf = fd_files.get(fd);
-			synchronized (read_raf) {
-				try {
-					long bytes_read = read_raf.read(buf);
-					if (bytes_read == -1) {
-						System.err.println("read: return bytes read [0]");
-						return 0;
-					}
-					System.err.printf("read: bytes read [%d]\n", bytes_read);
-					return bytes_read;
-				} catch (IOException e) {
-					System.err.println("read: error detected.");
-					System.err.println(e);
-					return -5;
+			try {
+				long bytes_read = read_raf.read(buf);
+				if (bytes_read == -1) {
+					return 0;
 				}
+				return bytes_read;
+			} catch (IOException e) {
+				System.err.println("read: " + e.toString());
+				return EIO;
 			}
 		}
 
+		/*
+		 * Function: lseek
+		 * This function implements the file lseek function.
+		 * 
+		 * @param fd - file descriptor of file
+		 * @param pos - file pointer offset
+		 * @param o - where to offset from
+		 * @return new file pointer position
+		 */
 		public long lseek (int fd, long pos, LseekOption o) {
-			System.err.printf("lseek: received fd [%d]\n", fd);
 			if (!fd_files.containsKey(fd)) {
-				System.err.printf("lseek: fd [%d] doesn't exist.\n", fd);
 				return Errors.EBADF;
 			}
-			String fd_path = fd_paths.get(fd) + "-fd" + fd;
+
+			String fd_path = fd_paths.get(fd);
+			if (!fd_path.startsWith(cache_dir)) {
+				fd_path = cache_dir + "/" + fd_paths.get(fd) + "-w" + fd;
+			}
+
 			File file = new File(fd_path);
 			if (file.isDirectory()) {
-				System.err.printf("lseek: fd [%d] is a directory\n", fd);
 				return Errors.EBADF;
 			}
 			if (!file.exists()) {
-				System.err.printf("lseek: fd [%d] doesn't exist\n", fd);
 				return Errors.EBADF;
 			}
+
 			RandomAccessFile lseek_raf = fd_files.get(fd);
-			synchronized (lseek_raf) {
-				try {
-					long new_pos;
-					switch (o) {
-						case FROM_CURRENT:
-							new_pos = lseek_raf.getFilePointer() + pos;
-							if (new_pos < 0) {
-								System.err.println("lseek: invalid new offset from current.\n");
-								return Errors.EINVAL;
-							}
-							System.err.printf("lseek (current): sent pos [%d]\n", new_pos);
-							lseek_raf.seek(new_pos);
-							return new_pos;
-						case FROM_END:
-							new_pos = lseek_raf.length() + pos;
-							if (new_pos < 0) {
-								System.err.println("lseek: invalid new offset from end.\n");
-								return Errors.EINVAL;
-							}
-							System.err.printf("lseek (end): sent pos [%d]\n", new_pos);
-							lseek_raf.seek(new_pos);
-							return new_pos;
-						case FROM_START:
-							if (pos < 0) {
-								System.err.println("lseek: invalid new offset from start.\n");
-								return Errors.EINVAL;
-							}
-							System.err.printf("lseek (start): sent pos [%d]\n", pos);
-							lseek_raf.seek(pos);
-							return pos;
-						default:
-							System.err.println("lseek: invalid option given.\n");
+			try {
+				long new_pos;
+				switch (o) {
+					case FROM_CURRENT:
+						new_pos = lseek_raf.getFilePointer() + pos;
+						if (new_pos < 0) {
 							return Errors.EINVAL;
-					}
-				} catch (IOException e) {
-					System.err.println("lseek: error detected.");
-					return -5;
+						}
+						lseek_raf.seek(new_pos);
+						return new_pos; 
+					case FROM_END:
+						new_pos = lseek_raf.length() + pos;
+						if (new_pos < 0) {
+							return Errors.EINVAL;
+						}
+						lseek_raf.seek(new_pos);
+						return new_pos;
+					case FROM_START:
+						if (pos < 0) {
+							return Errors.EINVAL;
+						}
+						lseek_raf.seek(pos);
+						return pos;
+					default:
+						return Errors.EINVAL;
 				}
+			} catch (IOException e) {
+				System.err.println("lseek: " + e.toString());
+				return EIO;
 			}
 		}
 
+		/*
+		 * Function: unlink
+		 * This function implements the file unlink function.
+		 * 
+		 * @param path - path of file to delete
+		 * @return 0 on success, error value on failure
+		 */
 		public int unlink (String path) {
-			System.err.printf("unlink: received path [%s]\n", path);
-			File file = new File(path);
+			String min_path = Path.of(path).normalize().toString();
+			File file = new File(min_path);
+
 			if (file.isDirectory() && file.list().length != 0) {
-				System.err.printf("unlink: path [%s] is not an empty directory.\n", path);
 				return Errors.ENOTEMPTY;
 			}
-			if (!file.exists()) {
-				System.err.printf("unlink: file doesn't exist for path [%s].\n", path);
-				return Errors.ENOENT;
-			}
-			synchronized (file) {
-				if (!file.delete()) {
-					System.err.printf("unlink: failed to delete file [%s].\n", path);
-					return Errors.EPERM;
+			try {
+				// need to check to make sure it exists on the server side
+				int success = stub.deleteFile(min_path);
+				if (success != 0) {
+					return Errors.ENOENT;
 				}
-				System.err.printf("unlink: successfully to deleted file [%s].\n", path);
-				return 0;
+			} catch (IOException e) {
+				System.err.println("unlink: " + e.toString());
+				return EIO;
 			}
+			return 0;
 		}
 
 		public void clientdone () {
@@ -554,6 +679,15 @@ class Proxy {
 		}
 	}
 
+	/*
+	 * Function: main
+	 * Sets up the proxy and communication with the server
+	 * 
+	 * @param args[0] - hostIP
+	 * @param args[1] - port value
+	 * @param args[2] - cache directory
+	 * @param args[3] - maximum cache size
+	 */
 	public static void main (String[] args) throws IOException {
 		fd_files = new ConcurrentHashMap<Integer, RandomAccessFile>();
 		fd_paths = new ConcurrentHashMap<Integer, String>();
@@ -568,19 +702,13 @@ class Proxy {
 		try {
 			Registry registry = LocateRegistry.getRegistry(hostIP, port);
 			stub = (RMIInterface) registry.lookup("RMIInterface");
-			String response = stub.sayHello("MyFancyClient");
-			System.err.println("Reponse: " + response);
 		} catch (RemoteException e) {
-			System.err.println("Unable to locate registry or unable to call RPC sayHello");
 			e.printStackTrace();
 			System.exit(1);
 		} catch (NotBoundException e) {
-			System.err.println("MyFancyInterface not found");
 			e.printStackTrace();
 			System.exit(1);
 		}
-
-		System.err.println("Starting!\n");
 		(new RPCreceiver(new FileHandlingFactory())).run();
 	}
 }
