@@ -1,5 +1,5 @@
 export CLASSPATH=$PWD:$PWD/../lib
 
-java Cloud 11122 ../lib/db1.txt c-1000-111 8
+java Cloud 11122 ../lib/db1.txt c-1000-111 0
 
-tar cvzf ../mysolution.tgz Makefile Server.java p3-ch1.pdf
+tar cvzf ../mysolution.tgz Makefile Server.java RMIInterface.java
