@@ -1,3 +1,11 @@
+/**
+ * File: Server.java
+ * Description: Implements the multi-tier scalable web service
+ * Author: Joseph Jia (josephji)
+ * 
+ * This file implements the entire multi-tier scable web service with dynamic scaling
+ */
+
 import java.util.*;
 import java.rmi.*;
 import java.rmi.server.*;
@@ -9,6 +17,12 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 	public static final int MASTER = 0;
 	public static final int FRONT = 1;
 	public static final int MIDDLE = 2;
+	public static final int INITIAL_TIME = 1500;
+	public static final int MASTER_PROCESS_TIME = 5000;
+	public static final int BETWEEN_TIME = 5000;
+	public static final double FRONT_SCALE_UP = 1.75;
+	public static final double MIDDLE_SCALE_UP = 1.85;
+	public static final double MIDDLE_SCALE_DOWN = 0.5;
 
 	// VM tracking variables
 	public static int role;
@@ -21,7 +35,9 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 
 	// global variables
 	public static boolean scaleDone;
-	public static long bootTime;
+	public static long lastTime;
+	public static long initialTime;
+	public static long currTime;
 	public static long elapsedTime;
 	public static double arrivalRate;
 	public static ServerLib SL;
@@ -34,44 +50,13 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 		super(); 
 	}
 
-	public void scaleUp (int role) {
-		// start the new VM
-		int newID = SL.startVM();
-		VMroles.put(newID, role);
-
-		// add to correct VM list
-		if (role == FRONT) frontVMs.add(newID);
-		else if (role == MIDDLE) middleVMs.add(newID);
-	}
-
-	public void scaleDown (int role) {
-		int numVMs, currID;
-		int currVM = 0;
-
-		// get number of VMs for given role
-		if (role == FRONT) numVMs = frontVMs.size();
-		else if (role == MIDDLE) numVMs = middleVMs.size();
-		else return;
-
-		while (currVM < numVMs) {
-			// get specific VM ID
-			if (role == FRONT) currID = frontVMs.get(currVM);
-			else if (role == MIDDLE) currID = middleVMs.get(currVM);
-			else currID = -1;
-
-			// find a running VM to end
-			if (currID != 1 && SL.getStatusVM(currID).equals(status.valueOf("Running"))) {
-				// remove VM from lists
-				VMroles.remove(currID);
-				if (role == FRONT) frontVMs.remove(currID);
-				else if (role == MIDDLE) middleVMs.remove(currID);
-
-				// stop VM
-				SL.endVM(currID);
-			}
-		}
-	}
-
+	/*
+	 * Function: main
+	 * Main implementation for the scalable web service
+	 * @param args[0] - IP value
+	 * @param args[1] - port value
+	 * @param args[2] - VM ID
+	 */
 	public static void main (String args[]) throws Exception {
 		// get command line arguments
 		if (args.length != 3) throw new Exception("Need 3 args: <cloud_ip> <cloud_port> <VM id>");
@@ -130,24 +115,34 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 
 			// get role of VM
 			role = stub.getRole(ID);
+			System.out.println(role);
 			// register front VMs
 			if (role == FRONT) SL.register_frontend();
 		}
 		
 		// get current time
-		bootTime = System.currentTimeMillis();
+		lastTime = System.currentTimeMillis();
+		initialTime = lastTime;
 		scaleDone = false;
 		int count = 0;
+		int currReqLen = 0;
+		int prevReqLen = 0;
+		int currLen = 0;
+		int prevLen = 0;
+
 		// main loop
 		while (true) {
 			Cloud.FrontEndOps.Request r;
 			// role-based execution
 			if (role == MASTER) {
 				// request load check (after 2 seconds)
-				elapsedTime = System.currentTimeMillis() - bootTime;
-				if (!scaleDone && elapsedTime > 2000) {
+				currTime = System.currentTimeMillis();
+				elapsedTime = currTime - lastTime;
+				
+				// initial VM scaling
+				if (!scaleDone && elapsedTime > INITIAL_TIME) {
 					int queueLen = SL.getQueueLength();
-					arrivalRate = (double)(queueLen + count) / Math.round(elapsedTime/1000.0); // find another way to track load value
+					arrivalRate = (double)(queueLen + count) / Math.round(elapsedTime/1000.0);
 					int arrivalInt = (int) Math.floor(arrivalRate + 0.45);
 					System.out.println("Requests done: " + count);
 					System.out.println("Queue length: " + queueLen);
@@ -174,36 +169,85 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 					System.out.println("Front VMs: " + fronts);
 					System.out.println("Middle VMs: " + middles);
 
-					// benchmarking loop
-					// int fronts = 1;
-					// int middles = 2;
+					// initial middle scaling
 					int tmpID;
 					for (int i = 1; i < middles; i++) {
 						tmpID = SL.startVM();
 						middleVMs.add(tmpID);
 						VMroles.put(tmpID, MIDDLE);
 					}
+					
+					// initial front scaling
 					for (int i = 1; i < fronts; i++) {
 						tmpID = SL.startVM();
 						frontVMs.add(tmpID);
 						VMroles.put(tmpID, FRONT);
 					};
+
 					scaleDone = true;
+					lastTime = currTime;
+					prevReqLen = reqs.size();
+					prevLen = queueLen;
 				}
 
-				// *** add some drop request mechanism ***
-				// if queue is getting too long and VMs haven't booted up yet
-				// if (SL.getQueueLength() > 3 * middleVMs.size()) SL.dropRequest(reqs.poll());
+				// dynamic scaling cooldown
+				if (scaleDone && elapsedTime > BETWEEN_TIME) {
+					int tmpID;
+					currLen = SL.getQueueLength();
+					int frontSize = frontVMs.size() + 1;
+					if (prevLen != 0 && (double)currLen > FRONT_SCALE_UP * prevLen) {
+						if (frontSize < 2) {
+							System.out.println("time: " + System.currentTimeMillis());
+							System.out.println("queueLens: " + currLen + "	" + prevLen);
+							System.out.println("frontSize: " + frontSize);
+							tmpID = SL.startVM();
+							frontVMs.add(tmpID);
+							VMroles.put(tmpID, FRONT);
+						}
+					}
+
+					currReqLen = reqs.size();
+					int middleSize = middleVMs.size();
+					if ((double)currReqLen >= prevReqLen * MIDDLE_SCALE_UP) {
+						int numVMs;
+						if (middleSize < 10) {
+							if (prevReqLen == 0) numVMs = currReqLen / 2;
+							else numVMs = (currReqLen / prevReqLen) - 1;
+							System.out.println("reqLen: " + currReqLen + "	" + prevReqLen);
+							System.out.println("middleSize: " + middleSize);
+							for (int i = 0; i < numVMs; i++) {
+								tmpID = SL.startVM();
+								middleVMs.add(tmpID);
+								VMroles.put(tmpID, MIDDLE);
+							}
+						}
+					}
+					else if (currReqLen < prevReqLen * MIDDLE_SCALE_DOWN) {
+						// should always have 1 middle VM
+						if (middleSize > 1) {
+							System.out.println("reqLen: " + currReqLen + "	" + prevReqLen);
+							tmpID = middleVMs.remove(middleSize - 1);
+							System.out.println("ID: " + tmpID);
+
+							// end middle vm from master
+							VMroles.remove(tmpID);
+							SL.endVM(tmpID);
+						}
+					}
+					lastTime = currTime;
+					prevReqLen = currReqLen;
+					prevLen = currLen;
+				}
 
 				// get next request from clients (act as front VM)
 				r = SL.getNextRequest();
 				count++;
 				// process request (act as middle VM until there is one ready)
-				if (middleVMs.size() == 0 || elapsedTime < 5000)
+				reqs.add(r);
+				if (middleVMs.size() == 0 || currTime - initialTime < MASTER_PROCESS_TIME) {
+					r = reqs.poll();
 					SL.processRequest(r);
-				// otherwise add it to the queue
-				else reqs.add(r);
-
+				}
 			}
 			else if (role == FRONT) {
 				// get next request from clients
@@ -220,10 +264,26 @@ public class Server extends UnicastRemoteObject implements RMIInterface{
 		}
 	}
 
+	/*
+	 * Function: getRole
+	 * Allows for a VM to get its role from the master VM
+	 * @param id - id of the VM
+	 * @return role - value of the role of the VM
+	 */
 	public int getRole (int id) throws RemoteException { return VMroles.get(id); }
 
+	/*
+	 * Function: addRequest
+	 * Allows for a frontend VM to add a request to the queue for the middle tier
+	 * @param r - request to add to the queue
+	 */
 	public void addRequest (Cloud.FrontEndOps.Request r) throws RemoteException { reqs.add(r); }
 
+	/*
+	 * Function: getRequest
+	 * Allows for a middle tier VM to get a request to process from the queue
+	 * @return r - request from the queue
+	 */
 	public Cloud.FrontEndOps.Request getRequest () throws RemoteException { return reqs.poll(); }
 
 }
