@@ -1,2 +1,9 @@
 export CLASSPATH=$PWD:$PWD/../lib
-tar cvzf ../mysolution.tgz Makefile Server.java UserNode.java
+
+tar -xf test.tar
+export CLASSPATH=$PWD/../handin:$PWD/../lib
+java Project4 11122 scripts/1-simple-commits.txt
+java Project4 11122 scripts/2-concurrent-commits.txt
+java Project4 11122 scripts/3-dropped-message.txt
+
+tar cvzf ../mysolution.tgz Makefile Server.java UserNode.java Message.java

@@ -1,4 +1,4 @@
-all: Server.class UserNode.class
+all: Message.class Server.class UserNode.class
 
 %.class: %.java
 	javac $<
